@@ -27,11 +27,11 @@ init_db()
 def add_expense(date, amount, category, subcategory="", note=""):
     '''Add an expense entry to the database.'''
     with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+        c.execute(
             "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES(?, ?, ?, ?, ?)",
             (date, amount, category, subcategory, note)
         )
-    return {"status": "ok", "id": cur.lastrowid}
+    return {"status": "ok", "id": c.lastrowid}
 
 @mcp.tool()
 def list_expenses(start_date, end_date):
@@ -47,7 +47,7 @@ def list_expenses(start_date, end_date):
             (start_date, end_date)
         )
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]    
+        return [dict(zip(cols, r)) for r in cur.fetchall()] 
 
 @mcp.tool()
 def summarize(start_date, end_date, category=None):
