@@ -598,6 +598,61 @@ def suggest_savings_amount(month: int, year: int) -> dict:
         "recommended_savings": salary * 0.20
     }
 
+@mcp.tool()
+def get_ai_financial_advice(month: int, year: int) -> dict:
+    '''Analyze financial data and generate AI-based advice for a given month and year.'''
+    with sqlite3.connect(DB_PATH) as c:
+        # Salary
+        cur = c.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+        row = cur.fetchone()
+        salary = row[0] if row else 0.0
+
+        # Expenses
+        date_pattern = f"{year}-{month:02d}-%"
+        cur = c.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern,))
+        row = cur.fetchone()
+        expenses = row[0] if row and row[0] is not None else 0.0
+
+        remaining = salary - expenses
+
+        # Top category
+        cur = c.execute("""
+            SELECT category, SUM(amount) as total_spent
+            FROM expenses
+            WHERE date LIKE ?
+            GROUP BY category
+            ORDER BY total_spent DESC
+            LIMIT 1
+        """, (date_pattern,))
+        row = cur.fetchone()
+        top_category = row[0] if row else None
+        top_category_spent = row[1] if row else 0.0
+
+    advice = []
+    
+    if salary > 0:
+        if expenses > 0.8 * salary:
+            advice.append("Your spending is quite high compared to your income.")
+            
+        savings_pct = (remaining / salary) * 100
+        if savings_pct < 10:
+            advice.append("Try increasing your savings to at least 20% of your salary.")
+        elif savings_pct >= 20:
+            advice.append(f"You are saving {savings_pct:.0f}% of your income, which is a good financial habit.")
+        else:
+            advice.append("Try allocating more money towards savings goals.")
+
+    if top_category and top_category_spent > 0:
+        advice.append(f"Your highest spending category is {top_category}. Consider reviewing these expenses.")
+
+    return {
+        "salary": salary,
+        "expenses": expenses,
+        "remaining": remaining,
+        "top_spending_category": top_category if top_category else "None",
+        "advice": advice
+    }
+
 if __name__ == "__main__":
     # mcp.run(transport="http", host="0.0.0.0", port=8000)
     mcp.run()
