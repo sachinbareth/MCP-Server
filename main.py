@@ -37,6 +37,15 @@ def init_db():
                 budget_amount REAL NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS savings_goal(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                goal_name TEXT,
+                target_amount REAL,
+                target_date TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
 init_db()
 
@@ -255,8 +264,340 @@ def get_total_available_balance(month: int, year: int) -> dict:
         "available_balance": current_salary + prev_remaining
     }
 
+@mcp.tool()
+def get_daily_expense_summary(start_date: str, end_date: str) -> list:
+    '''Return total expenses grouped by date.'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("""
+            SELECT date, SUM(amount) as total_expense
+            FROM expenses
+            WHERE date BETWEEN ? AND ?
+            GROUP BY date
+            ORDER BY date ASC
+        """, (start_date, end_date))
+        return [{"date": r[0], "total_expense": r[1]} for r in cur.fetchall()]
+
+@mcp.tool()
+def get_weekly_expense_summary(year: int) -> list:
+    '''Return total expenses grouped by week number.'''
+    with sqlite3.connect(DB_PATH) as c:
+        year_str = str(year)
+        cur = c.execute("""
+            SELECT cast(strftime('%W', date) as integer) as week, SUM(amount) as total_expense
+            FROM expenses
+            WHERE strftime('%Y', date) = ?
+            GROUP BY week
+            ORDER BY week ASC
+        """, (year_str,))
+        return [{"week": r[0], "total_expense": r[1]} for r in cur.fetchall()]
+
+@mcp.tool()
+def get_monthly_expense_summary(year: int) -> list:
+    '''Return expenses grouped by month.'''
+    with sqlite3.connect(DB_PATH) as c:
+        year_str = str(year)
+        cur = c.execute("""
+            SELECT strftime('%m', date) as month, SUM(amount) as total_expense
+            FROM expenses
+            WHERE strftime('%Y', date) = ?
+            GROUP BY month
+            ORDER BY month ASC
+        """, (year_str,))
+        return [{"month": r[0], "total_expense": r[1]} for r in cur.fetchall()]
+
+@mcp.tool()
+def get_yearly_expense_summary() -> list:
+    '''Return total expenses grouped by year.'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("""
+            SELECT strftime('%Y', date) as year, SUM(amount) as total_expense
+            FROM expenses
+            GROUP BY year
+            ORDER BY year ASC
+        """)
+        return [{"year": r[0], "total_expense": r[1]} for r in cur.fetchall()]
+
+@mcp.tool()
+def get_category_spending_report(start_date: str, end_date: str) -> list:
+    '''Return total spending per category.'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("""
+            SELECT category, SUM(amount) as total_spent
+            FROM expenses
+            WHERE date BETWEEN ? AND ?
+            GROUP BY category
+            ORDER BY category ASC
+        """, (start_date, end_date))
+        return [{"category": r[0], "total_spent": r[1]} for r in cur.fetchall()]
+
+@mcp.tool()
+def get_top_spending_categories(start_date: str, end_date: str, limit: int = 5) -> list:
+    '''Return categories with highest spending.'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("""
+            SELECT category, SUM(amount) as total_spent
+            FROM expenses
+            WHERE date BETWEEN ? AND ?
+            GROUP BY category
+            ORDER BY total_spent DESC
+            LIMIT ?
+        """, (start_date, end_date, limit))
+        return [{"category": r[0], "total_spent": r[1]} for r in cur.fetchall()]
+
+@mcp.tool()
+def compare_monthly_expenses(month1: int, year1: int, month2: int, year2: int) -> dict:
+    '''Return comparison between two months.'''
+    with sqlite3.connect(DB_PATH) as c:
+        date_pattern1 = f"{year1}-{month1:02d}-%"
+        date_pattern2 = f"{year2}-{month2:02d}-%"
+        
+        cur = c.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern1,))
+        row = cur.fetchone()
+        m1_total = row[0] if row and row[0] is not None else 0.0
+        
+        cur = c.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern2,))
+        row = cur.fetchone()
+        m2_total = row[0] if row and row[0] is not None else 0.0
+        
+        return {
+            "month1_total": m1_total,
+            "month2_total": m2_total,
+            "difference": abs(m1_total - m2_total)
+        }
+
+@mcp.tool()
+def get_expense_trend(year: int) -> list:
+    '''Return monthly spending trend data.'''
+    with sqlite3.connect(DB_PATH) as c:
+        year_str = str(year)
+        cur = c.execute("""
+            SELECT strftime('%m', date) as month, SUM(amount) as total_expense
+            FROM expenses
+            WHERE strftime('%Y', date) = ?
+            GROUP BY month
+            ORDER BY month ASC
+        """, (year_str,))
+        return [{"month": r[0], "total_expense": r[1]} for r in cur.fetchall()]
+
+@mcp.tool()
+def check_budget_exceeded(month: int, year: int) -> list:
+    '''Check if actual spending exceeds the defined budget for any category.'''
+    with sqlite3.connect(DB_PATH) as c:
+        date_pattern = f"{year}-{month:02d}-%"
+        
+        cur = c.execute("SELECT category, budget_amount FROM category_budget WHERE month = ? AND year = ?", (month, year))
+        budgets = {r[0]: r[1] for r in cur.fetchall()}
+        
+        cur = c.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE ? GROUP BY category", (date_pattern,))
+        spending = {r[0]: r[1] for r in cur.fetchall()}
+        
+        alerts = []
+        for cat, budget in budgets.items():
+            spent = spending.get(cat, 0.0)
+            if spent > budget:
+                alerts.append({
+                    "category": cat,
+                    "budget": budget,
+                    "spent": spent,
+                    "alert": "Budget exceeded"
+                })
+                
+        return alerts
+
+@mcp.tool()
+def check_budget_near_limit(month: int, year: int, threshold: float = 0.8) -> list:
+    '''Check if spending is near the budget limit (>= threshold * budget).'''
+    with sqlite3.connect(DB_PATH) as c:
+        date_pattern = f"{year}-{month:02d}-%"
+        
+        cur = c.execute("SELECT category, budget_amount FROM category_budget WHERE month = ? AND year = ?", (month, year))
+        budgets = {r[0]: r[1] for r in cur.fetchall()}
+        
+        cur = c.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE ? GROUP BY category", (date_pattern,))
+        spending = {r[0]: r[1] for r in cur.fetchall()}
+        
+        alerts = []
+        for cat, budget in budgets.items():
+            spent = spending.get(cat, 0.0)
+            if budget > 0 and spent >= (threshold * budget):
+                alerts.append({
+                    "category": cat,
+                    "budget": budget,
+                    "spent": spent,
+                    "usage_percent": round((spent / budget) * 100, 2),
+                    "alert": "Budget almost reached"
+                })
+                
+        return alerts
+
+@mcp.tool()
+def detect_high_spending(start_date: str, end_date: str) -> list:
+    '''Identify categories where spending is unusually high (e.g. greater than average category spending).'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("""
+            SELECT category, SUM(amount) as total_spent
+            FROM expenses
+            WHERE date BETWEEN ? AND ?
+            GROUP BY category
+        """, (start_date, end_date))
+        
+        categories_spending = [{"category": r[0], "spent": r[1]} for r in cur.fetchall()]
+        
+        if not categories_spending:
+            return []
+            
+        total_spending = sum(item["spent"] for item in categories_spending)
+        avg_spending = total_spending / len(categories_spending)
+        
+        alerts = []
+        for item in categories_spending:
+            if item["spent"] > avg_spending:
+                alerts.append({
+                    "category": item["category"],
+                    "spent": item["spent"],
+                    "avg_spending": round(avg_spending, 2),
+                    "alert": "High spending detected"
+                })
+                
+        return alerts
+
+@mcp.tool()
+def check_daily_spending_alert(date: str, limit: float) -> dict:
+    '''Check if total spending for a specific day exceeds the given limit.'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("SELECT SUM(amount) FROM expenses WHERE date = ?", (date,))
+        row = cur.fetchone()
+        spent = row[0] if row and row[0] is not None else 0.0
+        
+        if spent > limit:
+            return {
+                "date": date,
+                "spent": spent,
+                "limit": limit,
+                "alert": "Daily spending limit exceeded"
+            }
+        return {}
+
+@mcp.tool()
+def check_monthly_overspending(month: int, year: int) -> dict:
+    '''Check if total expenses for the month exceed the salary for that month.'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+        row = cur.fetchone()
+        
+        if not row:
+            return {} # or return an error as asked, but standard is empty if no alert/salary
+            
+        salary = row[0]
+        
+        date_pattern = f"{year}-{month:02d}-%"
+        cur = c.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern,))
+        row = cur.fetchone()
+        spent = row[0] if row and row[0] is not None else 0.0
+        
+        if spent > salary:
+            return {
+                "salary": salary,
+                "expenses": spent,
+                "alert": "Monthly overspending detected"
+            }
+        return {}
+
+@mcp.tool()
+def set_savings_goal(goal_name: str, target_amount: float, target_date: str) -> dict:
+    '''Set a new savings goal.'''
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute(
+            "INSERT INTO savings_goal(goal_name, target_amount, target_date) VALUES(?, ?, ?)",
+            (goal_name, target_amount, target_date)
+        )
+    return {
+        "status": "ok",
+        "goal_name": goal_name,
+        "target_amount": target_amount,
+        "target_date": target_date
+    }
+
+@mcp.tool()
+def get_savings_progress(month: int, year: int) -> dict:
+    '''Calculate savings progress for a specific month (Salary - Expenses).'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+        row = cur.fetchone()
+        salary = row[0] if row else 0.0
+
+        date_pattern = f"{year}-{month:02d}-%"
+        cur = c.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern,))
+        row = cur.fetchone()
+        expenses = row[0] if row and row[0] is not None else 0.0
+
+    return {
+        "month": month,
+        "year": year,
+        "salary": salary,
+        "expenses": expenses,
+        "saved": salary - expenses
+    }
+
+@mcp.tool()
+def get_monthly_savings(year: int) -> list:
+    '''Return savings for each month in a given year.'''
+    with sqlite3.connect(DB_PATH) as c:
+        # Get salary for each month
+        cur = c.execute("SELECT month, salary_amount FROM salary WHERE year = ?", (year,))
+        salaries = {r[0]: r[1] for r in cur.fetchall()}
+
+        # Get expenses for each month
+        year_str = str(year)
+        cur = c.execute("""
+            SELECT cast(strftime('%m', date) as integer) as month, SUM(amount)
+            FROM expenses
+            WHERE strftime('%Y', date) = ?
+            GROUP BY month
+        """, (year_str,))
+        expenses = {r[0]: r[1] for r in cur.fetchall()}
+
+    all_months = set(salaries.keys()).union(set(expenses.keys()))
+    
+    result = []
+    for m in sorted(all_months):
+        s = salaries.get(m, 0.0)
+        e = expenses.get(m, 0.0)
+        result.append({
+            "month": m,
+            "saved": s - e
+        })
+    return result
+
+@mcp.tool()
+def get_total_saved_money() -> dict:
+    '''Calculate total savings across all months (Total Salary - Total Expenses).'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("SELECT SUM(salary_amount) FROM salary")
+        row = cur.fetchone()
+        total_salary = row[0] if row and row[0] is not None else 0.0
+
+        cur = c.execute("SELECT SUM(amount) FROM expenses")
+        row = cur.fetchone()
+        total_expenses = row[0] if row and row[0] is not None else 0.0
+
+    return {
+        "total_saved": total_salary - total_expenses
+    }
+
+@mcp.tool()
+def suggest_savings_amount(month: int, year: int) -> dict:
+    '''Suggest a savings amount for a specific month (e.g., 20% of salary).'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+        row = cur.fetchone()
+        salary = row[0] if row else 0.0
+
+    return {
+        "salary": salary,
+        "recommended_savings": salary * 0.20
+    }
+
 if __name__ == "__main__":
     # mcp.run(transport="http", host="0.0.0.0", port=8000)
     mcp.run()
-
-
