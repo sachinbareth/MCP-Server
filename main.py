@@ -653,6 +653,116 @@ def get_ai_financial_advice(month: int, year: int) -> dict:
         "advice": advice
     }
 
+@mcp.tool()
+def generate_monthly_spending_chart(year: int) -> dict:
+    '''Generate a bar chart showing monthly expenses.'''
+    with sqlite3.connect(DB_PATH) as c:
+        year_str = str(year)
+        cur = c.execute("""
+            SELECT strftime('%m', date) as month, SUM(amount) as amount
+            FROM expenses
+            WHERE strftime('%Y', date) = ?
+            GROUP BY month
+            ORDER BY month ASC
+        """, (year_str,))
+        
+        month_names = {
+            "01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun",
+            "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"
+        }
+        
+        data = []
+        for r in cur.fetchall():
+            data.append({"month": month_names.get(r[0], r[0]), "amount": r[1]})
+            
+        return {
+            "chart_type": "bar",
+            "title": "Monthly Spending",
+            "data": data
+        }
+
+@mcp.tool()
+def generate_category_pie_chart(start_date: str, end_date: str) -> dict:
+    '''Generate a pie chart showing spending distribution.'''
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute("""
+            SELECT category, SUM(amount) as amount
+            FROM expenses
+            WHERE date BETWEEN ? AND ?
+            GROUP BY category
+            ORDER BY amount DESC
+        """, (start_date, end_date))
+        
+        categories = []
+        values = []
+        for r in cur.fetchall():
+            categories.append(r[0])
+            values.append(r[1])
+            
+        return {
+            "chart_type": "pie",
+            "categories": categories,
+            "values": values
+        }
+
+@mcp.tool()
+def generate_expense_trend_graph(year: int) -> dict:
+    '''Plot a line graph showing spending trend over time.'''
+    with sqlite3.connect(DB_PATH) as c:
+        year_str = str(year)
+        cur = c.execute("""
+            SELECT strftime('%m', date) as month, SUM(amount) as amount
+            FROM expenses
+            WHERE strftime('%Y', date) = ?
+            GROUP BY month
+            ORDER BY month ASC
+        """, (year_str,))
+        
+        month_names = {
+            "01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun",
+            "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"
+        }
+        
+        data = []
+        for r in cur.fetchall():
+            data.append({"month": month_names.get(r[0], r[0]), "amount": r[1]})
+            
+        return {
+            "chart_type": "line",
+            "title": "Expense Trend",
+            "data": data
+        }
+
+@mcp.tool()
+def generate_budget_vs_spending_chart(month: int, year: int) -> dict:
+    '''Generate a bar chart comparing budget vs actual spending.'''
+    with sqlite3.connect(DB_PATH) as c:
+        date_pattern = f"{year}-{month:02d}-%"
+        
+        cur = c.execute("SELECT category, budget_amount FROM category_budget WHERE month = ? AND year = ?", (month, year))
+        budgets = {r[0]: r[1] for r in cur.fetchall()}
+        
+        cur = c.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE ? GROUP BY category", (date_pattern,))
+        spending = {r[0]: r[1] for r in cur.fetchall()}
+        
+        categories = []
+        budget_values = []
+        spent_values = []
+        
+        all_categories = sorted(list(set(budgets.keys()).union(set(spending.keys()))))
+        
+        for cat in all_categories:
+            categories.append(cat)
+            budget_values.append(budgets.get(cat, 0.0))
+            spent_values.append(spending.get(cat, 0.0))
+            
+        return {
+            "chart_type": "bar",
+            "categories": categories,
+            "budget": budget_values,
+            "spent": spent_values
+        }
+
 if __name__ == "__main__":
     # mcp.run(transport="http", host="0.0.0.0", port=8000)
     mcp.run()
