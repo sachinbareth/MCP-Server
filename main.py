@@ -1,29 +1,37 @@
 import os
-import aiosqlite
+import psycopg
+from psycopg.rows import tuple_row
 import asyncio
+import sys
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 import tempfile
 from fastmcp import FastMCP
 
 # Use temporary directory for better write access compatibility
 TEMP_DIR = tempfile.gettempdir()
-DB_PATH = os.path.join(TEMP_DIR, "expenses.db")
+from dotenv import load_dotenv
+load_dotenv()
+DB_URL = os.environ.get("DB_URL")
+if not DB_URL:
+    raise ValueError("DB_URL environment variable is must be set in .env")
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
-print(f"Database path: {DB_PATH}")
+print("Using PostgreSQL Database")
 
 mcp = FastMCP("ExpenseTracker")
 
 def init_db():
     """Initializes the database synchronously at module load."""
     try:
-        import sqlite3
-        with sqlite3.connect(DB_PATH) as db:
-            db.execute("PRAGMA journal_mode=WAL")
+        import psycopg
+        with psycopg.connect(DB_URL) as db:
+            
             db.execute("""
                 CREATE TABLE IF NOT EXISTS expenses(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     date TEXT NOT NULL,
-                    amount REAL NOT NULL,
+                    amount NUMERIC NOT NULL,
                     category TEXT NOT NULL,
                     subcategory TEXT DEFAULT '',
                     note TEXT DEFAULT ''
@@ -31,26 +39,26 @@ def init_db():
             """)
             db.execute("""
                 CREATE TABLE IF NOT EXISTS salary(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     month INTEGER NOT NULL,
                     year INTEGER NOT NULL,
-                    salary_amount REAL NOT NULL
+                    salary_amount NUMERIC NOT NULL
                 )
             """)
             db.execute("""
                 CREATE TABLE IF NOT EXISTS category_budget(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     category TEXT NOT NULL,
                     month INTEGER NOT NULL,
                     year INTEGER NOT NULL,
-                    budget_amount REAL NOT NULL
+                    budget_amount NUMERIC NOT NULL
                 )
             """)
             db.execute("""
                 CREATE TABLE IF NOT EXISTS savings_goal(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id SERIAL PRIMARY KEY,
                     goal_name TEXT,
-                    target_amount REAL,
+                    target_amount NUMERIC,
                     target_date TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -68,12 +76,13 @@ init_db()
 async def add_expense(date: str, amount: float, category: str, subcategory: str = "", note: str = ""):
     '''Add a new expense entry to the database.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute(
-                "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
+                "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                 (date, amount, category, subcategory, note)
             )
-            expense_id = cur.lastrowid
+            row = await cur.fetchone()
+            expense_id = row[0] if row else None
             await db.commit()
             return {"status": "success", "id": expense_id, "message": "Expense added successfully"}
     except Exception as e:
@@ -83,12 +92,12 @@ async def add_expense(date: str, amount: float, category: str, subcategory: str 
 async def list_expenses(start_date: str, end_date: str):
     '''List expense entries within an inclusive date range.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute(
                 """
                 SELECT id, date, amount, category, subcategory, note
                 FROM expenses
-                WHERE date BETWEEN ? AND ?
+                WHERE date BETWEEN %s AND %s
                 ORDER BY date DESC, id DESC
                 """,
                 (start_date, end_date)
@@ -103,15 +112,15 @@ async def list_expenses(start_date: str, end_date: str):
 async def summarize(start_date: str, end_date: str, category: str = None):
     '''Summarize expenses by category within an inclusive date range.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             query = """
                 SELECT category, SUM(amount) AS total_amount, COUNT(*) as count
                 FROM expenses
-                WHERE date BETWEEN ? AND ?
+                WHERE date BETWEEN %s AND %s
             """
             params = [start_date, end_date]
             if category:
-                query += " AND category = ?"
+                query += " AND category = %s"
                 params.append(category)
             query += " GROUP BY category ORDER BY total_amount DESC"
             
@@ -128,28 +137,28 @@ async def update_expense(expense_id: int, date: str = None, amount: float = None
     updates = []
     params = []
     if date is not None:
-        updates.append("date = ?")
+        updates.append("date = %s")
         params.append(date)
     if amount is not None:
-        updates.append("amount = ?")
+        updates.append("amount = %s")
         params.append(amount)
     if category is not None:
-        updates.append("category = ?")
+        updates.append("category = %s")
         params.append(category)
     if subcategory is not None:
-        updates.append("subcategory = ?")
+        updates.append("subcategory = %s")
         params.append(subcategory)
     if note is not None:
-        updates.append("note = ?")
+        updates.append("note = %s")
         params.append(note)
     if not updates:
         return {"status": "error", "message": "No fields to update provided"}
         
-    query = f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?"
+    query = f"UPDATE expenses SET {', '.join(updates)} WHERE id = %s"
     params.append(expense_id)
     
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute(query, params)
             await db.commit()
             if cur.rowcount == 0:
@@ -162,8 +171,8 @@ async def update_expense(expense_id: int, date: str = None, amount: float = None
 async def delete_expense(expense_id: int) -> dict:
     '''Delete an expense entry by its ID.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("DELETE FROM expenses WHERE id = %s", (expense_id,))
             await db.commit()
             if cur.rowcount == 0:
                 return {"status": "error", "message": f"Expense {expense_id} not found"}
@@ -175,13 +184,13 @@ async def delete_expense(expense_id: int) -> dict:
 async def set_salary(month: int, year: int, amount: float) -> dict:
     '''Set or update salary for a specific month and year.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT id FROM salary WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT id FROM salary WHERE month = %s AND year = %s", (month, year))
             row = await cur.fetchone()
             if row:
-                await db.execute("UPDATE salary SET salary_amount = ? WHERE id = ?", (amount, row[0]))
+                await db.execute("UPDATE salary SET salary_amount = %s WHERE id = %s", (amount, row[0]))
             else:
-                await db.execute("INSERT INTO salary(month, year, salary_amount) VALUES(?, ?, ?)", (month, year, amount))
+                await db.execute("INSERT INTO salary(month, year, salary_amount) VALUES(%s, %s, %s)", (month, year, amount))
             await db.commit()
             return {"status": "ok", "month": month, "year": year, "salary": amount}
     except Exception as e:
@@ -191,13 +200,13 @@ async def set_salary(month: int, year: int, amount: float) -> dict:
 async def set_category_budget(category: str, month: int, year: int, amount: float) -> dict:
     '''Define a monthly budget for each category.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT id FROM category_budget WHERE category = ? AND month = ? AND year = ?", (category, month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT id FROM category_budget WHERE category = %s AND month = %s AND year = %s", (category, month, year))
             row = await cur.fetchone()
             if row:
-                await db.execute("UPDATE category_budget SET budget_amount = ? WHERE id = ?", (amount, row[0]))
+                await db.execute("UPDATE category_budget SET budget_amount = %s WHERE id = %s", (amount, row[0]))
             else:
-                await db.execute("INSERT INTO category_budget(category, month, year, budget_amount) VALUES(?, ?, ?, ?)", (category, month, year, amount))
+                await db.execute("INSERT INTO category_budget(category, month, year, budget_amount) VALUES(%s, %s, %s, %s)", (category, month, year, amount))
             await db.commit()
             return {"status": "ok", "category": category, "month": month, "year": year, "budget": amount}
     except Exception as e:
@@ -208,11 +217,11 @@ async def get_category_budget_status(month: int, year: int) -> list:
     '''Combine budget and spending to show category budget status.'''
     try:
         date_pattern = f"{year}-{month:02d}-%"
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT category, budget_amount FROM category_budget WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT category, budget_amount FROM category_budget WHERE month = %s AND year = %s", (month, year))
             budgets = {r[0]: r[1] for r in await cur.fetchall()}
             
-            cur = await db.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE ? GROUP BY category", (date_pattern,))
+            cur = await db.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE %s GROUP BY category", (date_pattern,))
             spending = {r[0]: r[1] for r in await cur.fetchall()}
         
         all_categories = set(budgets.keys()).union(set(spending.keys()))
@@ -234,13 +243,13 @@ async def get_category_budget_status(month: int, year: int) -> list:
 async def get_remaining_balance(month: int, year: int) -> dict:
     '''Calculate salary minus total expenses for that month.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = %s AND year = %s", (month, year))
             row = await cur.fetchone()
             salary = row[0] if row else 0.0
             
             date_pattern = f"{year}-{month:02d}-%"
-            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern,))
+            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE %s", (date_pattern,))
             row = await cur.fetchone()
             expenses = row[0] if row and row[0] is not None else 0.0
             
@@ -257,11 +266,11 @@ async def get_weekly_expense_summary(year: int) -> list:
     '''Return total expenses grouped by week number.'''
     try:
         year_str = str(year)
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
-                SELECT cast(strftime('%W', date) as integer) as week, SUM(amount) as total_expense
+                SELECT cast(extract(week from date::date) as integer) as week, SUM(amount) as total_expense
                 FROM expenses
-                WHERE strftime('%Y', date) = ?
+                WHERE substring(date from 1 for 4) = %s
                 GROUP BY week
                 ORDER BY week ASC
             """, (year_str,))
@@ -274,20 +283,20 @@ async def get_weekly_expense_summary(year: int) -> list:
 async def get_ai_financial_advice(month: int, year: int) -> dict:
     '''Analyze financial data and generate AI-based advice.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = %s AND year = %s", (month, year))
             row = await cur.fetchone()
             salary = row[0] if row else 0.0
 
             date_pattern = f"{year}-{month:02d}-%"
-            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern,))
+            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE %s", (date_pattern,))
             row = await cur.fetchone()
             expenses = row[0] if row and row[0] is not None else 0.0
 
             cur = await db.execute("""
                 SELECT category, SUM(amount) as total_spent
                 FROM expenses
-                WHERE date LIKE ?
+                WHERE date LIKE %s
                 GROUP BY category
                 ORDER BY total_spent DESC
                 LIMIT 1
@@ -325,11 +334,11 @@ async def get_category_spending(month: int, year: int) -> list:
     '''Calculate total spending in each category for a specific month.'''
     try:
         date_pattern = f"{year}-{month:02d}-%"
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
                 SELECT category, SUM(amount) as spent
                 FROM expenses
-                WHERE date LIKE ?
+                WHERE date LIKE %s
                 GROUP BY category
             """, (date_pattern,))
             rows = await cur.fetchall()
@@ -347,20 +356,20 @@ async def get_total_available_balance(month: int, year: int) -> dict:
             prev_month = 12
             prev_year -= 1
             
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             # Current salary
-            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = %s AND year = %s", (month, year))
             row = await cur.fetchone()
             current_salary = row[0] if row else 0.0
             
             # Previous salary
-            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (prev_month, prev_year))
+            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = %s AND year = %s", (prev_month, prev_year))
             row = await cur.fetchone()
             prev_salary = row[0] if row else 0.0
             
             # Previous expenses
             prev_date_pattern = f"{prev_year}-{prev_month:02d}-%"
-            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (prev_date_pattern,))
+            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE %s", (prev_date_pattern,))
             row = await cur.fetchone()
             prev_spent = row[0] if row and row[0] is not None else 0.0
             
@@ -380,11 +389,11 @@ async def get_total_available_balance(month: int, year: int) -> dict:
 async def get_daily_expense_summary(start_date: str, end_date: str) -> list:
     '''Return total expenses grouped by date.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
                 SELECT date, SUM(amount) as total_expense
                 FROM expenses
-                WHERE date BETWEEN ? AND ?
+                WHERE date BETWEEN %s AND %s
                 GROUP BY date
                 ORDER BY date ASC
             """, (start_date, end_date))
@@ -398,11 +407,11 @@ async def get_monthly_expense_summary(year: int) -> list:
     '''Return expenses grouped by month.'''
     try:
         year_str = str(year)
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
-                SELECT strftime('%m', date) as month, SUM(amount) as total_expense
+                SELECT substring(date from 6 for 2) as month, SUM(amount) as total_expense
                 FROM expenses
-                WHERE strftime('%Y', date) = ?
+                WHERE substring(date from 1 for 4) = %s
                 GROUP BY month
                 ORDER BY month ASC
             """, (year_str,))
@@ -415,9 +424,9 @@ async def get_monthly_expense_summary(year: int) -> list:
 async def get_yearly_expense_summary() -> list:
     '''Return total expenses grouped by year.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
-                SELECT strftime('%Y', date) as year, SUM(amount) as total_expense
+                SELECT substring(date from 1 for 4) as year, SUM(amount) as total_expense
                 FROM expenses
                 GROUP BY year
                 ORDER BY year ASC
@@ -431,11 +440,11 @@ async def get_yearly_expense_summary() -> list:
 async def get_category_spending_report(start_date: str, end_date: str) -> list:
     '''Return total spending per category.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
                 SELECT category, SUM(amount) as total_spent
                 FROM expenses
-                WHERE date BETWEEN ? AND ?
+                WHERE date BETWEEN %s AND %s
                 GROUP BY category
                 ORDER BY category ASC
             """, (start_date, end_date))
@@ -448,14 +457,14 @@ async def get_category_spending_report(start_date: str, end_date: str) -> list:
 async def get_top_spending_categories(start_date: str, end_date: str, limit: int = 5) -> list:
     '''Return categories with highest spending.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
                 SELECT category, SUM(amount) as total_spent
                 FROM expenses
-                WHERE date BETWEEN ? AND ?
+                WHERE date BETWEEN %s AND %s
                 GROUP BY category
                 ORDER BY total_spent DESC
-                LIMIT ?
+                LIMIT %s
             """, (start_date, end_date, limit))
             rows = await cur.fetchall()
             return [{"category": r[0], "total_spent": r[1]} for r in rows]
@@ -466,15 +475,15 @@ async def get_top_spending_categories(start_date: str, end_date: str, limit: int
 async def compare_monthly_expenses(month1: int, year1: int, month2: int, year2: int) -> dict:
     '''Return comparison between two months.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             date_pattern1 = f"{year1}-{month1:02d}-%"
             date_pattern2 = f"{year2}-{month2:02d}-%"
             
-            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern1,))
+            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE %s", (date_pattern1,))
             row = await cur.fetchone()
             m1_total = row[0] if row and row[0] is not None else 0.0
             
-            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern2,))
+            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE %s", (date_pattern2,))
             row = await cur.fetchone()
             m2_total = row[0] if row and row[0] is not None else 0.0
             
@@ -491,11 +500,11 @@ async def get_expense_trend(year: int) -> list:
     '''Return monthly spending trend data.'''
     try:
         year_str = str(year)
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
-                SELECT strftime('%m', date) as month, SUM(amount) as total_expense
+                SELECT substring(date from 6 for 2) as month, SUM(amount) as total_expense
                 FROM expenses
-                WHERE strftime('%Y', date) = ?
+                WHERE substring(date from 1 for 4) = %s
                 GROUP BY month
                 ORDER BY month ASC
             """, (year_str,))
@@ -509,11 +518,11 @@ async def check_budget_exceeded(month: int, year: int) -> list:
     '''Check if actual spending exceeds the defined budget for any category.'''
     try:
         date_pattern = f"{year}-{month:02d}-%"
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT category, budget_amount FROM category_budget WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT category, budget_amount FROM category_budget WHERE month = %s AND year = %s", (month, year))
             budgets = {r[0]: r[1] for r in await cur.fetchall()}
             
-            cur = await db.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE ? GROUP BY category", (date_pattern,))
+            cur = await db.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE %s GROUP BY category", (date_pattern,))
             spending = {r[0]: r[1] for r in await cur.fetchall()}
             
         alerts = []
@@ -535,11 +544,11 @@ async def check_budget_near_limit(month: int, year: int, threshold: float = 0.8)
     '''Check if spending is near the budget limit (>= threshold * budget).'''
     try:
         date_pattern = f"{year}-{month:02d}-%"
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT category, budget_amount FROM category_budget WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT category, budget_amount FROM category_budget WHERE month = %s AND year = %s", (month, year))
             budgets = {r[0]: r[1] for r in await cur.fetchall()}
             
-            cur = await db.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE ? GROUP BY category", (date_pattern,))
+            cur = await db.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE %s GROUP BY category", (date_pattern,))
             spending = {r[0]: r[1] for r in await cur.fetchall()}
             
         alerts = []
@@ -561,11 +570,11 @@ async def check_budget_near_limit(month: int, year: int, threshold: float = 0.8)
 async def detect_high_spending(start_date: str, end_date: str) -> list:
     '''Identify categories where spending is unusually high (e.g. greater than average category spending).'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
                 SELECT category, SUM(amount) as total_spent
                 FROM expenses
-                WHERE date BETWEEN ? AND ?
+                WHERE date BETWEEN %s AND %s
                 GROUP BY category
             """, (start_date, end_date))
             rows = await cur.fetchall()
@@ -594,8 +603,8 @@ async def detect_high_spending(start_date: str, end_date: str) -> list:
 async def check_daily_spending_alert(date: str, limit: float) -> dict:
     '''Check if total spending for a specific day exceeds the given limit.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date = ?", (date,))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date = %s", (date,))
             row = await cur.fetchone()
             spent = row[0] if row and row[0] is not None else 0.0
             
@@ -614,15 +623,15 @@ async def check_daily_spending_alert(date: str, limit: float) -> dict:
 async def check_monthly_overspending(month: int, year: int) -> dict:
     '''Check if total expenses for the month exceed the salary for that month.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = %s AND year = %s", (month, year))
             row = await cur.fetchone()
             if not row:
                 return {}
             salary = row[0]
             
             date_pattern = f"{year}-{month:02d}-%"
-            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern,))
+            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE %s", (date_pattern,))
             row = await cur.fetchone()
             spent = row[0] if row and row[0] is not None else 0.0
             
@@ -640,9 +649,9 @@ async def check_monthly_overspending(month: int, year: int) -> dict:
 async def set_savings_goal(goal_name: str, target_amount: float, target_date: str) -> dict:
     '''Set a new savings goal.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             await db.execute(
-                "INSERT INTO savings_goal(goal_name, target_amount, target_date) VALUES(?, ?, ?)",
+                "INSERT INTO savings_goal(goal_name, target_amount, target_date) VALUES(%s, %s, %s)",
                 (goal_name, target_amount, target_date)
             )
             await db.commit()
@@ -659,13 +668,13 @@ async def set_savings_goal(goal_name: str, target_amount: float, target_date: st
 async def get_savings_progress(month: int, year: int) -> dict:
     '''Calculate savings progress for a specific month (Salary - Expenses).'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = %s AND year = %s", (month, year))
             row = await cur.fetchone()
             salary = row[0] if row else 0.0
 
             date_pattern = f"{year}-{month:02d}-%"
-            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE ?", (date_pattern,))
+            cur = await db.execute("SELECT SUM(amount) FROM expenses WHERE date LIKE %s", (date_pattern,))
             row = await cur.fetchone()
             expenses = row[0] if row and row[0] is not None else 0.0
 
@@ -683,17 +692,17 @@ async def get_savings_progress(month: int, year: int) -> dict:
 async def get_monthly_savings(year: int) -> list:
     '''Return savings for each month in a given year.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             # Get salary for each month
-            cur = await db.execute("SELECT month, salary_amount FROM salary WHERE year = ?", (year,))
+            cur = await db.execute("SELECT month, salary_amount FROM salary WHERE year = %s", (year,))
             salaries = {r[0]: r[1] for r in await cur.fetchall()}
 
             # Get expenses for each month
             year_str = str(year)
             cur = await db.execute("""
-                SELECT cast(strftime('%m', date) as integer) as month, SUM(amount)
+                SELECT cast(substring(date from 6 for 2) as integer) as month, SUM(amount)
                 FROM expenses
-                WHERE strftime('%Y', date) = ?
+                WHERE substring(date from 1 for 4) = %s
                 GROUP BY month
             """, (year_str,))
             expenses_dict = {r[0]: r[1] for r in await cur.fetchall()}
@@ -715,7 +724,7 @@ async def get_monthly_savings(year: int) -> list:
 async def get_total_saved_money() -> dict:
     '''Calculate total savings across all months (Total Salary - Total Expenses).'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("SELECT SUM(salary_amount) FROM salary")
             row = await cur.fetchone()
             total_salary = row[0] if row and row[0] is not None else 0.0
@@ -734,8 +743,8 @@ async def get_total_saved_money() -> dict:
 async def suggest_savings_amount(month: int, year: int) -> dict:
     '''Suggest a savings amount for a specific month (e.g., 20% of salary).'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT salary_amount FROM salary WHERE month = %s AND year = %s", (month, year))
             row = await cur.fetchone()
             salary = row[0] if row else 0.0
 
@@ -751,11 +760,11 @@ async def generate_monthly_spending_chart(year: int) -> dict:
     '''Generate a bar chart showing monthly expenses.'''
     try:
         year_str = str(year)
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
-                SELECT strftime('%m', date) as month, SUM(amount) as amount
+                SELECT substring(date from 6 for 2) as month, SUM(amount) as amount
                 FROM expenses
-                WHERE strftime('%Y', date) = ?
+                WHERE substring(date from 1 for 4) = %s
                 GROUP BY month
                 ORDER BY month ASC
             """, (year_str,))
@@ -782,11 +791,11 @@ async def generate_monthly_spending_chart(year: int) -> dict:
 async def generate_category_pie_chart(start_date: str, end_date: str) -> dict:
     '''Generate a pie chart showing spending distribution.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
                 SELECT category, SUM(amount) as amount
                 FROM expenses
-                WHERE date BETWEEN ? AND ?
+                WHERE date BETWEEN %s AND %s
                 GROUP BY category
                 ORDER BY amount DESC
             """, (start_date, end_date))
@@ -811,11 +820,11 @@ async def generate_expense_trend_graph(year: int) -> dict:
     '''Plot a line graph showing spending trend over time.'''
     try:
         year_str = str(year)
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
             cur = await db.execute("""
-                SELECT strftime('%m', date) as month, SUM(amount) as amount
+                SELECT substring(date from 6 for 2) as month, SUM(amount) as amount
                 FROM expenses
-                WHERE strftime('%Y', date) = ?
+                WHERE substring(date from 1 for 4) = %s
                 GROUP BY month
                 ORDER BY month ASC
             """, (year_str,))
@@ -843,11 +852,11 @@ async def generate_budget_vs_spending_chart(month: int, year: int) -> dict:
     '''Generate a bar chart comparing budget vs actual spending.'''
     try:
         date_pattern = f"{year}-{month:02d}-%"
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT category, budget_amount FROM category_budget WHERE month = ? AND year = ?", (month, year))
+        async with await psycopg.AsyncConnection.connect(DB_URL) as db:
+            cur = await db.execute("SELECT category, budget_amount FROM category_budget WHERE month = %s AND year = %s", (month, year))
             budgets = {r[0]: r[1] for r in await cur.fetchall()}
             
-            cur = await db.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE ? GROUP BY category", (date_pattern,))
+            cur = await db.execute("SELECT category, SUM(amount) FROM expenses WHERE date LIKE %s GROUP BY category", (date_pattern,))
             spending = {r[0]: r[1] for r in await cur.fetchall()}
             
         categories = []
