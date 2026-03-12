@@ -2050,5 +2050,16 @@ def categories():
     except Exception as e:
         return f'{{"error": "Could not load categories: {str(e)}"}}'
 
+# if __name__ == "__main__":
+#     mcp.run(transport="http", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+# Vercel entrypoint
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/")
+def home():
+    return {"message": "MCP Expense Tracker Running"}
+
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
