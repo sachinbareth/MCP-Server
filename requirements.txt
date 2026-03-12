@@ -1,2 +1,8 @@
 fastmcp
 aiosqlite
+fastmcp
+uvicorn
+psycopg[binary]
+python-dotenv
+fastapi
+uvicorn
